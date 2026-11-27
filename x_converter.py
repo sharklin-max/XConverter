@@ -54,6 +54,41 @@ def find_ffmpeg():
 FFMPEG = find_ffmpeg()
 
 
+def _app_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+LOG_PATH = os.path.join(_app_dir(), "XConverter.log")
+
+
+def _file_log(msg):
+    """诊断日志: 所有 log_cb 内容都带时间戳追加到 EXE 旁的
+    XConverter.log, 下载失败时把这个文件发来就能定位到哪一步。"""
+    try:
+        import datetime
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write("[%s] %s\n" % (ts, msg))
+    except Exception:
+        pass
+
+
+def _tee_log(log_cb):
+    """把 log_cb 再分一路写进诊断日志文件 (界面/命令行照常显示)。"""
+    orig = log_cb or (lambda t: None)
+
+    def tee(t):
+        try:
+            orig(t)
+        except Exception:
+            pass
+        _file_log(t)
+
+    return tee
+
+
 def get_duration(path):
     """用 ffmpeg -i 解析时长(秒), 失败返回 0。"""
     try:
@@ -96,7 +131,7 @@ class Converter:
 
     def __init__(self, progress_cb=None, log_cb=None):
         self.progress_cb = progress_cb or (lambda f, t: None)
-        self.log_cb = log_cb or (lambda t: None)
+        self.log_cb = _tee_log(log_cb)
         self._proc = None
         self._cancelled = False
 
@@ -197,7 +232,7 @@ class Downloader:
 
     def __init__(self, progress_cb=None, log_cb=None):
         self.progress_cb = progress_cb or (lambda f, t: None)
-        self.log_cb = log_cb or (lambda t: None)
+        self.log_cb = _tee_log(log_cb)
         self._proc = None
         self._cancelled = False
 
@@ -393,7 +428,9 @@ class Downloader:
             caption = re.sub(r'[\\/:*?"<>|\r\n]+', "_", mc.group(1)).strip()
         name = (caption + "_" if caption else "") + \
             ("kuaishou_" + pid if pid else "kuaishou_video") + ".mp4"
-        dst = os.path.join(outdir, name)
+        dst = self._safe_dst(
+            outdir, name,
+            ("kuaishou_" + pid if pid else "kuaishou_video") + ".mp4")
         self.log_cb("已解析到视频直链, 开始下载…")
         req2 = urllib.request.Request(
             video_url, headers={"User-Agent": ua,
@@ -420,6 +457,347 @@ class Downloader:
         self.progress_cb(1.0, "完成")
         return dst
 
+    # ---------------------------------------------------------- B 站自研解析
+    BL_HOSTS = ("bilibili.com", "b23.tv", "bili2233.cn")
+
+    _BL_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/120.0.0.0 Safari/537.36")
+
+    def _bl_headers(self, referer=None, dest="empty"):
+        """仿真 Chrome 请求头 + buvid3 设备 cookie。
+        B 站风控认设备: 裸 Python 请求没有 buvid3, 会被直接 412
+        (浏览器能打开是因为它自带这些)。buvid3 只生成一次、存在
+        EXE 旁的 .xconv_buvid 里, 以后一直用同一个, 像台固定设备。"""
+        import json as _json
+        import time as _time
+        import uuid as _uuid
+        buvid_file = os.path.join(_app_dir(), ".xconv_buvid")
+        data = {}
+        try:
+            with open(buvid_file, "r", encoding="utf-8") as f:
+                data = _json.load(f)
+        except Exception:
+            data = {}
+        if not data.get("buvid3"):
+            data = {"buvid3": str(_uuid.uuid4()).upper(),
+                    "b_nut": int(_time.time())}
+            try:
+                with open(buvid_file, "w", encoding="utf-8") as f:
+                    _json.dump(data, f)
+            except Exception:
+                pass
+        h = {
+            "User-Agent": self._BL_UA,
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Cookie": "buvid3=%s; b_nut=%s" % (data["buvid3"],
+                                               data["b_nut"]),
+            "Sec-Ch-Ua": '"Chromium";v="120", "Not_A Brand";v="99"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Sec-Fetch-Dest": dest,
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-site",
+        }
+        if referer:
+            h["Referer"] = referer
+        return h
+
+    def _bl_json(self, url):
+        """B 站官方接口 (未登录可用, 大部分公开视频 720p/1080p)。
+        返回解析后的 JSON dict, code 非 0 时抛 RuntimeError。"""
+        import json as _json
+        import urllib.request
+        req = urllib.request.Request(
+            url, headers=self._bl_headers(
+                referer="https://www.bilibili.com/"))
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read()
+        except Exception as e:
+            raise RuntimeError("B站接口请求失败: " + str(e)[:160])
+        try:
+            data = _json.loads(raw.decode("utf-8", "ignore"))
+        except Exception:
+            raise RuntimeError("B站接口返回了非 JSON 内容 "
+                               "(可能被风控拦截, HTTP 412)")
+        if not isinstance(data, dict) or data.get("code") != 0:
+            msg = data.get("message", "") if isinstance(data, dict) else ""
+            raise RuntimeError("B站接口拒绝 (code %s: %s)" %
+                               (data.get("code"), msg))
+        return data["data"]
+
+    def _bl_http_download(self, url, dst, referer, weight0, weight1):
+        """带 Referer 的分段下载 (B 站 CDN 要求 Referer)。
+        weight0..weight1 为本段在总进度中的占比。"""
+        import urllib.request
+        req = urllib.request.Request(
+            url, headers=self._bl_headers(referer=referer, dest="video"))
+        try:
+            resp = urllib.request.urlopen(req, timeout=60)
+        except Exception as e:
+            raise RuntimeError("B站流下载失败: " + str(e)[:160])
+        with resp, open(dst, "wb") as f:
+            total = int(resp.headers.get("Content-Length") or 0)
+            done = 0
+            while True:
+                if self._cancelled:
+                    raise RuntimeError("已取消")
+                chunk = resp.read(1 << 18)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                if total:
+                    frac = weight0 + (weight1 - weight0) * done / total
+                    self.progress_cb(frac,
+                                     f"下载中 {frac * 100:.0f}%")
+        if os.path.getsize(dst) == 0:
+            raise RuntimeError("B站流下载为空, CDN 可能拒绝了请求")
+
+    @staticmethod
+    def _safe_dst(outdir, name, fallback):
+        """输出文件名含中文时, 在英文系统/Wine 下可能因 ANSI 代码页
+        写不进文件; 先探一下, 不行就退回纯 ASCII 名, 别让整个
+        下载失败。"""
+        dst = os.path.join(outdir, name)
+        existed = os.path.exists(dst)
+        try:
+            with open(dst, "ab"):
+                pass
+            if not existed:
+                os.remove(dst)
+            return dst
+        except Exception:
+            return os.path.join(outdir, fallback)
+
+    def _run_bilibili(self, url, outdir, quality="best"):
+        """B 站官方 API 自研解析: view 接口取 cid/title, playurl
+        接口取 DASH 音视频流, ffmpeg 合并。失败时抛错, 由上层
+        改走 yt-dlp 兜底。返回最终文件路径。"""
+        import urllib.request
+        self.log_cb("B站链接, 走自研解析…")
+        # b23.tv 等短链先跟随跳转到真实视频页 (HEAD 不行时改 GET)
+        # 注意: 最终页请求失败 (如 412 风控) 时 urllib 抛 HTTPError,
+        # 但错误对象仍带最终 URL (含 BV 号), 一定要先取出来再继续
+        for _method in ("HEAD", "GET"):
+            try:
+                req = urllib.request.Request(
+                    url, headers=self._bl_headers(),
+                    method=_method)
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    url = resp.geturl()
+                break
+            except Exception as e:
+                final = getattr(e, "geturl", None)
+                if callable(final):
+                    try:
+                        url = final()
+                    except Exception:
+                        pass
+                if re.search(r"BV[0-9A-Za-z]{10}", url):
+                    break
+                continue
+        m = re.search(r"BV[0-9A-Za-z]{10}", url)
+        page = 1
+        pm = re.search(r"[?&]p=(\d+)", url)
+        if pm:
+            page = max(1, int(pm.group(1)))
+        bvid = m.group(0) if m else None
+        aid = None
+        if not bvid:
+            am = re.search(r"/av(\d+)", url)
+            if am:
+                aid = am.group(1)
+        if not bvid and not aid:
+            raise RuntimeError("B站解析失败: 链接里找不到 BV 号或 av 号")
+        self.log_cb("B站: 解析到 %s (第 %d P)" % (bvid or ("av" + aid), page))
+        view_url = ("https://api.bilibili.com/x/web-interface/view?"
+                    + ("bvid=" + bvid if bvid else "aid=" + aid))
+        info = self._bl_json(view_url)
+        title = re.sub(r'[\\/:*?"<>|\r\n]+', "_",
+                       str(info.get("title") or "bilibili_video")).strip()
+        title = title[:60] or "bilibili_video"
+        pages = info.get("pages") or []
+        cid = None
+        for p in pages:
+            if p.get("page") == page:
+                cid = p.get("cid")
+                break
+        cid = cid or info.get("cid")
+        if not cid:
+            raise RuntimeError("B站解析失败: 未取到视频 cid")
+        self.log_cb("B站: 《%s》 cid=%s" % (title, cid))
+        referer = "https://www.bilibili.com/video/" + \
+            (bvid or ("av" + str(aid)))
+        qn = {"best": 80, "1080": 80, "720": 64, "audio": 0}.get(quality, 80)
+        play_url = ("https://api.bilibili.com/x/player/playurl?"
+                    "fnver=0&fnval=16&fourk=1"
+                    + ("&bvid=" + bvid if bvid else "&aid=" + aid)
+                    + "&cid=%s&qn=%d" % (cid, qn))
+        play = self._bl_json(play_url)
+        dash = play.get("dash") or {}
+        videos = dash.get("video") or []
+        audios = dash.get("audio") or []
+        self.log_cb("B站: 取到 %d 条视频流 / %d 条音频流" %
+                    (len(videos), len(audios)))
+        cap = {"best": 1080, "1080": 1080, "720": 720}.get(quality, 1080)
+        name = "%s_bilibili_%s%s" % (
+            title, bvid or ("av" + str(aid)),
+            ("_p%d" % page) if page > 1 else "")
+        ext = ".mp3" if quality == "audio" else ".mp4"
+        dst = self._safe_dst(
+            outdir, name + ext,
+            "bilibili_" + (bvid or ("av" + str(aid))) + ext)
+        tmpdir = os.path.join(outdir, ".xconv_tmp")
+        os.makedirs(tmpdir, exist_ok=True)
+        try:
+            if quality == "audio":
+                if not audios:
+                    raise RuntimeError("B站解析失败: 该视频无可用音频流")
+                a = max(audios, key=lambda s: s.get("bandwidth", 0))
+                a_path = os.path.join(tmpdir, "audio.m4s")
+                self._bl_http_download(a["baseUrl"], a_path, referer, 0, 0.8)
+                self._ffmpeg_merge_audio(a_path, dst)
+                self.log_cb("B站: 音频已转 MP3 %s (%.1f MB)" %
+                            (os.path.basename(dst),
+                             os.path.getsize(dst) / 1e6))
+                self.progress_cb(1.0, "完成")
+                return dst
+            if not videos:
+                durl = play.get("durl") or []
+                if durl and durl[0].get("url"):
+                    self._bl_http_download(durl[0]["url"], dst, referer,
+                                           0, 1.0)
+                    self.log_cb("B站: 已下载 %s (%.1f MB)" %
+                                (os.path.basename(dst),
+                                 os.path.getsize(dst) / 1e6))
+                    self.progress_cb(1.0, "完成")
+                    return dst
+                raise RuntimeError("B站解析失败: 未取到视频流 "
+                                   "(可能需登录/大会员, 或被风控拦截)")
+            # 无登录时 DASH 常被压到 480p；此时试 html5 MP4 直链，
+            # 不登录常能拿到 720p（单文件含音画，不用合并）。只有当直链
+            # 画质确实高于 DASH 时才改走直链，否则继续用 DASH。
+            dash_max = max((v.get("height", 0) for v in videos),
+                           default=0)
+            if quality != "audio" and dash_max < 720:
+                try:
+                    h5_url = ("https://api.bilibili.com/x/player/playurl?"
+                              "fnver=0&fnval=1&fourk=1"
+                              + ("&bvid=" + bvid if bvid else "&aid=" + aid)
+                              + "&cid=%s&qn=80&platform=html5&high_quality=1"
+                              % cid)
+                    h5 = self._bl_json(h5_url)
+                    h5_durl = h5.get("durl") or []
+                    h5_qn = h5.get("quality") or 0
+                    h5_h = {112: 1080, 80: 1080, 64: 720, 32: 480,
+                            16: 360, 6: 240}.get(h5_qn, 0)
+                    if h5_durl and h5_durl[0].get("url") and h5_h > dash_max:
+                        self.log_cb("B站: html5 直链 %dp，高于 DASH %dp，"
+                                    "改走直链…" % (h5_h, dash_max))
+                        segs = []
+                        for i, s in enumerate(h5_durl):
+                            p = os.path.join(tmpdir, "seg%d.mp4" % i)
+                            self._bl_http_download(
+                                s["url"], p, referer, 0, 1.0)
+                            segs.append(p)
+                        if len(segs) == 1:
+                            os.replace(segs[0], dst)
+                        else:
+                            self._ffmpeg_concat(segs, dst)
+                        self.log_cb("B站: 已下载 %s (%.1f MB)" %
+                                    (os.path.basename(dst),
+                                     os.path.getsize(dst) / 1e6))
+                        self.progress_cb(1.0, "完成")
+                        return dst
+                except Exception as e:
+                    self.log_cb("B站: html5 直链不可用 (%s)，继续用 DASH…"
+                                % str(e)[:100])
+            ok_v = [v for v in videos
+                    if v.get("height", 9999) <= cap and v.get("baseUrl")]
+            # 同分辨率下优先 avc (H.264): 下出来的文件 Windows/X
+            # 能直接播; hevc (hvc1) 还得再转一次, 只当没得选时用
+            def _vkey(s):
+                codecs = str(s.get("codecs", ""))
+                return (s.get("height", 0),
+                        1 if codecs.startswith("avc") else 0,
+                        s.get("bandwidth", 0))
+            v = max(ok_v or videos, key=_vkey)
+            self.log_cb("B站: 选流 id=%s %s %sx%s 带宽 %d" %
+                        (v.get("id"), v.get("codecs"),
+                         v.get("width"), v.get("height"),
+                         v.get("bandwidth", 0)))
+            v_path = os.path.join(tmpdir, "video.m4s")
+            self._bl_http_download(v["baseUrl"], v_path, referer, 0, 0.7)
+            self.log_cb("B站: 视频流已下 %.1f MB" %
+                        (os.path.getsize(v_path) / 1e6))
+            if audios:
+                a = max(audios, key=lambda s: s.get("bandwidth", 0))
+                a_path = os.path.join(tmpdir, "audio.m4s")
+                self._bl_http_download(a["baseUrl"], a_path, referer,
+                                       0.7, 0.95)
+                self.log_cb("B站: 音频流已下 %.1f MB" %
+                            (os.path.getsize(a_path) / 1e6))
+                self._ffmpeg_merge(v_path, a_path, dst)
+                self.log_cb("B站: 合并完成 %s (%.1f MB)" %
+                            (os.path.basename(dst),
+                             os.path.getsize(dst) / 1e6))
+            else:
+                os.replace(v_path, dst)
+                self.log_cb("B站: 无音频, 仅保存视频流 %s" %
+                            os.path.basename(dst))
+            self.progress_cb(1.0, "完成")
+            return dst
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def _ffmpeg_merge(self, video, audio, dst):
+        import subprocess
+        cmd = [FFMPEG, "-y", "-i", video, "-i", audio,
+               "-c", "copy", dst]
+        self._proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            creationflags=CREATE_NO_WINDOW)
+        _, err = self._proc.communicate()
+        if self._proc.returncode != 0:
+            raise RuntimeError("ffmpeg 合并失败: "
+                               + err.decode("utf-8", "ignore")[-200:])
+
+    def _ffmpeg_concat(self, files, dst):
+        """多段 MP4/FLV 首尾拼成一个文件 (html5 直链长视频可能分段)。"""
+        import subprocess
+        lst = os.path.join(os.path.dirname(files[0]), "concat.txt")
+        with open(lst, "w", encoding="utf-8") as f:
+            for p in files:
+                f.write("file '%s'\n" % p.replace("'", "'\\''"))
+        cmd = [FFMPEG, "-y", "-f", "concat", "-safe", "0",
+               "-i", lst, "-c", "copy", dst]
+        self._proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            creationflags=CREATE_NO_WINDOW)
+        _, err = self._proc.communicate()
+        if self._proc.returncode != 0:
+            raise RuntimeError("ffmpeg 拼接失败: "
+                               + err.decode("utf-8", "ignore")[-200:])
+
+    def _ffmpeg_merge_audio(self, audio, dst):
+        import subprocess
+        cmd = [FFMPEG, "-y", "-i", audio, "-vn",
+               "-c:a", "libmp3lame", "-q:a", "2", dst]
+        self._proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            creationflags=CREATE_NO_WINDOW)
+        _, err = self._proc.communicate()
+        if self._proc.returncode != 0:
+            raise RuntimeError("ffmpeg 转音频失败: "
+                               + err.decode("utf-8", "ignore")[-200:])
+
     @staticmethod
     def _snapshot(outdir):
         found = set()
@@ -445,6 +823,32 @@ class Downloader:
         if any(host0 == h or host0.endswith("." + h) for h in self.KS_HOSTS):
             self._run_kuaishou(url, outdir)
             return "kuaishou", sorted(self._snapshot(outdir) - before)
+        bl_hint = ""
+        if any(host0 == h or host0.endswith("." + h) for h in self.BL_HOSTS):
+            if cookies and cookies != "none":
+                # 登录态交给 yt-dlp：它带真实 SESSDATA，能拿到 1080p；
+                # 自研解析无登录态，部分视频（如影视剪辑）只能到 480p，
+                # 先跑自研解析反而会把画质锁死在 480p
+                self.log_cb("已选浏览器登录态，改走 yt-dlp（可拿满画质）…")
+            else:
+                try:
+                    dst = self._run_bilibili(url, outdir, quality)
+                    return "bilibili", [dst]
+                except RuntimeError as e:
+                    # 自研解析失败 (风控/登录可见/接口改版) 时改走 yt-dlp,
+                    # yt-dlp 可配合浏览器 cookies 选项处理登录可见视频
+                    # 完整错误先写进诊断日志 (界面上只显示截短版)
+                    self.log_cb("B站自研解析失败详情: " + str(e))
+                    self.log_cb("B站自研解析失败, 改走 yt-dlp… ("
+                                + str(e)[:120] + ")")
+                    if "412" in str(e):
+                        # B 站对这台电脑的裸请求做了风控拦截: 浏览器能开是
+                        # 因为它带登录态, 下面的 yt-dlp 兜底也一样会被拦,
+                        # 只有借用浏览器登录态才绕得过去
+                        bl_hint = ("\n\n提示: B站对裸请求做了风控拦截 (412)。"
+                                   "请在下载页打开「借用浏览器登录态」选 "
+                                   "chrome（需先在 Chrome 里登录过 B站）"
+                                   "再重试，或过段时间再试。")
         try:
             self._run_ytdlp(url, outdir, quality, cookies)
             return "yt-dlp", sorted(self._snapshot(outdir) - before)
@@ -454,12 +858,15 @@ class Downloader:
             host = re.sub(r"^https?://", "", url).split("/")[0].lower()
             if any(host == h or host.endswith("." + h)
                    for h in self.VIDEO_ONLY_HOSTS):
+                if bl_hint:
+                    raise RuntimeError(str(e) + bl_hint)
                 raise
             self.log_cb("视频引擎没下成, 试试图文引擎…")
             try:
                 self._run_gallery(url, outdir)
             except RuntimeError:
-                raise RuntimeError(str(e) + "\n(图文引擎也未能处理这个链接)")
+                raise RuntimeError(str(e) + "\n(图文引擎也未能处理这个链接)"
+                                   + bl_hint)
             return "gallery-dl", sorted(self._snapshot(outdir) - before)
 
 
@@ -477,7 +884,7 @@ class Extractor:
 
     def __init__(self, progress_cb=None, log_cb=None):
         self.progress_cb = progress_cb or (lambda f, t: None)
-        self.log_cb = log_cb or (lambda t: None)
+        self.log_cb = _tee_log(log_cb)
         self._proc = None
         self._cancelled = False
         self._ocr_engine = None
@@ -682,31 +1089,29 @@ class Extractor:
 
 
 # ---------------------------------------------------------------- CLI 模式
-_LOG_PATH = os.path.join(
-    os.path.dirname(sys.executable if getattr(sys, "frozen", False)
-                   else os.path.abspath(__file__)), "XConverter_cli.log")
+# 旧日志名 XConverter_cli.log 已统一为顶部的 XConverter.log (LOG_PATH),
+# 界面和命令行共用同一份诊断日志
 
 
 def _out(msg):
     """CLI 输出: 先试 stdout(窗口版 EXE 无控制台时 stdout 可能为 None),
-    无论如何同时写一份日志文件, 避免中文在 cp1252 控制台下崩溃。"""
+    避免中文在 cp1252 控制台下崩溃。
+    注意: 经 log_cb 发出的内容已由 _tee_log 写进诊断日志, 这里只打印
+    不再重复写; 会话开头/结尾与完整 traceback 由 cli() 直接记日志。"""
     try:
         print(msg, flush=True)
-    except Exception:
-        pass
-    try:
-        with open(_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(str(msg) + "\n")
     except Exception:
         pass
 
 
 def cli(argv):
+    import traceback
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
+    _file_log("===== CLI 启动: " + " ".join(argv) + " =====")
     args = [a for a in argv if not a.startswith("--")]
     split = "--split" in argv
     if "--download" in argv:
@@ -726,9 +1131,12 @@ def cli(argv):
         try:
             engine, _files = dl.download(url, outdir, quality, cookies)
             _out(f"download ok via {engine} -> {outdir}")
+            _file_log("CLI 下载成功 via " + engine)
             return 0
         except Exception as e:
             _out("download failed: " + str(e))
+            _file_log("CLI 下载失败: " + str(e))
+            _file_log(traceback.format_exc())
             return 1
     if "--extract" in argv:
         if not args:
@@ -743,6 +1151,8 @@ def cli(argv):
             return 0
         except Exception as e:
             _out("extract failed: " + str(e))
+            _file_log("CLI 提取失败: " + str(e))
+            _file_log(traceback.format_exc())
             return 1
     if len(args) < 2:
         _out("usage: XConverter input output [--split]")
@@ -875,13 +1285,15 @@ def gui():
                 messagebox.showinfo("完成", "已生成:\n" + "\n".join(outs))
             root.after(0, done)
         except Exception as e:
-            def fail():
+            # 注意: except 块结束时会删掉 e, 闭包必须用默认参数先接住,
+            # 否则 root.after 延后执行时报 NameError, 错误框弹不出来
+            def fail(err=e):
                 state["running"] = False
                 start_btn.config(state="normal")
                 cancel_btn.config(state="disabled")
                 status.config(text="转换失败或已取消")
-                if str(e) != "已取消":
-                    messagebox.showerror("错误", str(e))
+                if str(err) != "已取消":
+                    messagebox.showerror("错误", str(err))
             root.after(0, fail)
 
     def start():
@@ -986,6 +1398,18 @@ def gui():
                             width=8, state="disabled")
     dcancel_btn.pack(side="left", padx=6)
 
+    def open_log():
+        try:
+            if os.path.exists(LOG_PATH):
+                os.startfile(LOG_PATH)
+            else:
+                d_set_status("暂无日志文件 (还未跑过下载/转换)")
+        except Exception as e:
+            d_set_status("打不开日志: " + str(e)[:100])
+
+    tk.Button(dbtns, text="查看日志", font=("Microsoft YaHei", 11),
+              width=8, command=open_log).pack(side="left", padx=6)
+
     from tkinter import scrolledtext
     tk.Label(tab_dl, text="提取的文字:", font=("Microsoft YaHei", 10)).pack(
         anchor="w", padx=30, pady=(4, 2))
@@ -1021,6 +1445,8 @@ def gui():
         root.after(0, upd)
 
     def d_work():
+        _file_log("===== GUI 下载: %s 画质=%s 登录态=%s =====" % (
+            url_var.get(), quality.get(), cookies.get()))
         dl = Downloader(progress_cb=d_set_progress, log_cb=d_set_status)
         dstate["dl"] = dl
         try:
@@ -1058,13 +1484,18 @@ def gui():
                 messagebox.showinfo("完成", f"已下载到:\n{dir_var.get()}" + note)
             root.after(0, done)
         except Exception as e:
-            def fail():
+            # 注意: except 块结束时会删掉 e, 闭包必须用默认参数先接住,
+            # 否则 root.after 延后执行时报 NameError, 错误框弹不出来
+            def fail(err=e):
                 dstate["running"] = False
                 dstart_btn.config(state="normal")
                 dcancel_btn.config(state="disabled")
                 dstatus.config(text="下载失败或已取消")
-                if str(e) != "已取消":
-                    messagebox.showerror("错误", str(e)[:800])
+                if str(err) != "已取消":
+                    messagebox.showerror(
+                        "错误", str(err)[:800] +
+                        "\n\n详细步骤见 EXE 旁的 XConverter.log\n"
+                        "(点「查看日志」可打开, 发给作者定位问题)")
             root.after(0, fail)
 
     def d_start():
